@@ -46,11 +46,48 @@ const yrcCorsApi = "https://cors.emnasop.cn/api/lyric?id=IDZFC";
   Meting API中没有提供逐词歌词,所以使用网易云官方接口并使用Cors代理获取逐词歌词
 */
 
+const CACHE_KEY = `playlist-cache-${playlistId}`;
+const CACHE_TTL = 30 * 60 * 1000; // 30 分钟
+const NETESE_URL_BASE = "https://music.163.com/song/media/outer/url?id=";
+
+const extractSongId = (song: any): string | null => {
+  if (song.id) return String(song.id);
+  if (song.url) {
+    const match = String(song.url).match(/\d+/g);
+    return match ? match[match.length - 1] : null;
+  }
+  return null;
+};
+
 const progressPercent = computed(() => {
   if (!duration.value || !isFinite(duration.value) || duration.value === 0)
     return 0;
   return Math.min(100, Math.max(0, (progress.value / duration.value) * 100));
 });
+
+// 对于不支持逐词播放的歌词行，计算匀速填充进度
+const lineUniformProgress = computed(() => {
+  const idx = currentLyricIndex.value;
+  const line = allLyrics.value[idx];
+  if (!line) return 0;
+
+  const startTime = line.time;
+  let endTime: number;
+  if (idx < allLyrics.value.length - 1) {
+    endTime = allLyrics.value[idx + 1].time;
+  } else if (audioRef.value?.duration && isFinite(audioRef.value.duration)) {
+    endTime = audioRef.value.duration;
+  } else {
+    endTime = startTime + 5;
+  }
+
+  const duration = endTime - startTime;
+  if (duration <= 0) return 0;
+
+  const progress = ((currentTime.value - startTime) / duration) * 100;
+  return Math.min(100, Math.max(0, progress));
+});
+
 type LrcSeg = {
   Duration: number;
   start: number;
@@ -167,13 +204,13 @@ async function parseYrc(datae: any) {
         }
         if (eljson[eljson.length - 1].text == "&nbsp;") eljson.pop();
       }
-      text = text.replace(/\(\d+,\d+,\d+\)/g, "");
+      text = text.replace(/\(\d+,\d+,\d+\)/g, "").trim();
       pdjg = prpdl(yrc, timesec);
       json.push({
         time: timesec,
         text: text,
         etext: eljson,
-        pairlyric: pdjg.pairtext,
+        pairlyric: pdjg.pairtext || undefined,
       });
     }
   } else if (yrc.lrc.lyric) {
@@ -193,20 +230,19 @@ async function parseYrc(datae: any) {
       pdjg = prpdl(yrc, timesec);
       json.push({
         time: timesec,
-        text: lyricMatch[4]+(pdjg.pairtext?` (${pdjg.pairtext})`:''),
+        text: lyricMatch[4].trim(),
+        pairlyric: pdjg.pairtext || undefined,
       });
     }
   }
-  console.log(json);
   return json;
 }
 
 const loadLyricsForCurrentSong = async () => {
   const song = playlist.value[currentIndex.value];
+  const id = song?.id;
+  if (!id) return;
   try {
-    const zz = song?.url?.match(/\d+/g);
-    const id = zz ? zz[zz.length-1] : null;
-    if(!id) return;
     const yrc = await (await fetch(yrcCorsApi.replace("IDZFC", id))).json();
     allLyrics.value = await parseYrc(yrc);
     return;
@@ -253,48 +289,74 @@ const onClickOutside = (event: MouseEvent) => {
   }
 };
 
+const handleKeydown = (e: KeyboardEvent) => {
+  // 不在输入框中响应空格
+  const tag = (e.target as HTMLElement).tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement).isContentEditable) return;
+  if (e.code === "Space") {
+    e.preventDefault();
+    togglePlay();
+  }
+};
+
 onMounted(() => {
   document.addEventListener("click", onClickOutside);
+  document.addEventListener("keydown", handleKeydown);
 });
 onBeforeUnmount(() => {
   document.removeEventListener("click", onClickOutside);
+  document.removeEventListener("keydown", handleKeydown);
   if (rafId) cancelAnimationFrame(rafId);
 });
 
-watch(currentUrl, () => {
-  if ("mediaSession" in navigator && currentIndex.value !== -1) {
-    const song = playlist.value[currentIndex.value];
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: song.name,
-      artist: song.artist,
-      artwork: [{ src: song.pic || "", sizes: "512x512", type: "image/png" }],
-    });
-  }
-});
 
 const togglePlayer = () => {
   isOpen.value = !isOpen.value;
 };
 
-const playCurrent = (autoPlay = true, resetProgress = true) => {
+const playCurrent = async (autoPlay = true, resetProgress = true) => {
   if (!playlist.value.length || !audioRef.value) return;
 
-  currentIndex.value = playlist.value.findIndex(
-    (s) => s.url === currentUrl.value
-  );
-  if (currentIndex.value === -1) {
+  // 确保 currentIndex 有效
+  if (currentIndex.value < 0 || currentIndex.value >= playlist.value.length) {
     currentIndex.value = 0;
-    currentUrl.value = playlist.value[0]?.url || null;
   }
-  audioRef.value.src = playlist.value[currentIndex.value].url;
+
+  const song = playlist.value[currentIndex.value];
+
+  // 按需构造音频 URL（网易云标准外部播放地址）
+  if (!song.url) {
+    const id = song.id || extractSongId(song);
+    if (id) {
+      song.url = `${NETESE_URL_BASE}${id}.mp3`;
+    }
+    if (!song.url) {
+      nextTrack();
+      return;
+    }
+  }
+
+  currentUrl.value = song.url;
+  audioRef.value.src = song.url;
+
+  // 恢复缓存的歌曲时长
+  if (song.id) {
+    const cachedDur = localStorage.getItem(`song-dur-${song.id}`);
+    if (cachedDur) {
+      const d = parseFloat(cachedDur);
+      if (d > 0 && isFinite(d)) duration.value = d;
+    }
+  }
+
   if (resetProgress) {
     audioRef.value.currentTime = 0;
     progress.value = 0;
   }
   if (autoPlay) {
-    audioRef.value.play();
+    audioRef.value.play().catch(() => {
+      isPlaying.value = false;
+    });
   }
-  const song = playlist.value[currentIndex.value];
   if ("mediaSession" in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: song.name,
@@ -307,7 +369,7 @@ const playCurrent = (autoPlay = true, resetProgress = true) => {
 };
 
 const selectTrack = (index: number) => {
-  currentUrl.value = playlist.value[index]?.url || null;
+  currentIndex.value = index;
   playCurrent();
 };
 
@@ -316,7 +378,9 @@ const togglePlay = () => {
   if (isPlaying.value) {
     audioRef.value.pause();
   } else {
-    audioRef.value.play();
+    audioRef.value.play().catch(() => {
+      isPlaying.value = false;
+    });
   }
 };
 
@@ -342,11 +406,22 @@ const onPause = () => {
 };
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let lastCachedDurationId: string | null = null;
 const updateProgress = () => {
   if (!audioRef.value) return;
   progress.value = audioRef.value.currentTime;
-  duration.value = audioRef.value.duration || 0;
-  
+  const d = audioRef.value.duration;
+  if (d && isFinite(d)) {
+    duration.value = d;
+    // 缓存歌曲时长到 localStorage
+    const song = playlist.value[currentIndex.value];
+    const songId = song?.id;
+    if (songId && songId !== lastCachedDurationId) {
+      localStorage.setItem(`song-dur-${songId}`, String(d));
+      lastCachedDurationId = songId;
+    }
+  }
+
   // 使用防抖保存状态，避免频繁写入 localStorage
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
@@ -386,11 +461,10 @@ const nextTrack = () => {
     while (nextIdx === currentIndex.value && playlist.value.length > 1) {
       nextIdx = Math.floor(Math.random() * playlist.value.length);
     }
-    currentUrl.value = playlist.value[nextIdx].url;
+    currentIndex.value = nextIdx;
     playCurrent();
   } else {
-    let nextIdx = (currentIndex.value + 1) % playlist.value.length;
-    currentUrl.value = playlist.value[nextIdx].url;
+    currentIndex.value = (currentIndex.value + 1) % playlist.value.length;
     playCurrent();
   }
 };
@@ -402,12 +476,11 @@ const prevTrack = () => {
     while (prevIdx === currentIndex.value && playlist.value.length > 1) {
       prevIdx = Math.floor(Math.random() * playlist.value.length);
     }
-    currentUrl.value = playlist.value[prevIdx].url;
+    currentIndex.value = prevIdx;
     playCurrent();
   } else {
-    let prevIdx =
+    currentIndex.value =
       (currentIndex.value - 1 + playlist.value.length) % playlist.value.length;
-    currentUrl.value = playlist.value[prevIdx].url;
     playCurrent();
   }
 };
@@ -424,8 +497,7 @@ const formatTime = (sec: number) => {
 };
 
 const saveState = () => {
-  if (currentUrl.value)
-    localStorage.setItem("player-currentUrl", currentUrl.value);
+  localStorage.setItem("player-songIndex", currentIndex.value.toString());
   localStorage.setItem("player-progress", progress.value.toString());
   localStorage.setItem("player-isPlaying", isPlaying.value.toString());
   localStorage.setItem("player-volume", volume.value.toString());
@@ -433,14 +505,25 @@ const saveState = () => {
 };
 
 const loadState = () => {
-  const savedUrl = localStorage.getItem("player-currentUrl");
-  if (savedUrl) currentUrl.value = savedUrl;
+  // 优先用 songIndex（新格式）
+  const savedIndex = localStorage.getItem("player-songIndex");
+  if (savedIndex !== null) {
+    currentIndex.value = parseInt(savedIndex) || 0;
+  } else {
+    // 兼容旧版 currentUrl 格式
+    const savedUrl = localStorage.getItem("player-currentUrl");
+    if (savedUrl) {
+      const idx = playlist.value.findIndex(
+        (s) => s.url === savedUrl
+      );
+      if (idx !== -1) currentIndex.value = idx;
+    }
+  }
 
   const savedProgress = localStorage.getItem("player-progress");
   if (savedProgress) progress.value = +savedProgress;
 
   const savedPlaying = localStorage.getItem("player-isPlaying");
-  // 只有明确保存过"true"状态时才自动播放，否则默认不播放
   isPlaying.value = savedPlaying === "true";
 
   const savedVolume = localStorage.getItem("player-volume");
@@ -489,26 +572,63 @@ watch(isOpen, async () => {
   }
 });
 
-onMounted(async () => {
+
+const loadPlaylist = async () => {
+  // 优先使用缓存
+  const cached = localStorage.getItem(CACHE_KEY);
+  if (cached) {
+    try {
+      const data = JSON.parse(cached);
+      if (Date.now() - data.timestamp < CACHE_TTL && data.songs?.length) {
+        playlist.value = data.songs;
+        return;
+      }
+    } catch {}
+  }
+
+  // 缓存失效或不存在，从 API 拉取
   const res = await fetch(metingApi);
-  playlist.value = await res.json();
+  const raw = await res.json();
+
+  // 为每条歌曲添加 id，缓存时剔除 url（url 有有效期）
+  const processed = raw.map((s: any) => ({
+    ...s,
+    id: extractSongId(s),
+  }));
+  playlist.value = processed;
+
+  // 存入缓存（不含 url）
+  const toCache = processed.map((s: any) => ({
+    id: s.id,
+    name: s.name,
+    artist: s.artist,
+    pic: s.pic,
+    lrc: s.lrc,
+  }));
+  localStorage.setItem(
+    CACHE_KEY,
+    JSON.stringify({ timestamp: Date.now(), songs: toCache })
+  );
+};
+
+onMounted(async () => {
+  await loadPlaylist();
 
   loadState();
 
-  if (!currentUrl.value && playlist.value.length) {
-    currentUrl.value = playlist.value[0].url;
-  }
-  loadLyricsForCurrentSong();
   if (audioRef.value) {
     audioRef.value.volume = volume.value;
   }
 
-  playCurrent(false, false);
+  await playCurrent(false, false);
 
   if (audioRef.value) {
     audioRef.value.currentTime = progress.value;
     if (isPlaying.value) {
-      audioRef.value.play();
+      audioRef.value.play().catch(() => {
+        isPlaying.value = false;
+        saveState();
+      });
     }
   }
   if (audioRef.value) {
@@ -517,7 +637,6 @@ onMounted(async () => {
     audioRef.value.onloadedmetadata = () => {
       if (audioRef.value && progress.value > 0) {
         audioRef.value.currentTime = progress.value;
-        // 恢复进度后立即更新歌词到对应位置
         updateLyric();
       }
       if (isPlaying.value) {
@@ -533,10 +652,10 @@ onMounted(async () => {
   if ("mediaSession" in navigator) {
     const song = playlist.value[currentIndex.value];
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: song.name,
-      artist: song.artist,
-      album: "", // 可选
-      artwork: [{ src: song.pic || "", sizes: "100x100", type: "image/png" }],
+      title: song?.name || "",
+      artist: song?.artist || "",
+      album: "",
+      artwork: [{ src: song?.pic || "", sizes: "100x100", type: "image/png" }],
     });
 
     navigator.mediaSession.setActionHandler("play", () => {
@@ -552,7 +671,6 @@ onMounted(async () => {
       nextTrack();
     });
   }
-  loadLyricsForCurrentSong();
   nextTick(() => {
     updateMarqueeStatus();
     nextTick(() => updateMarqueeStatus());
@@ -606,10 +724,16 @@ window.addEventListener("resize", updateMarqueeStatus);
                   ? '100%'
                   : '0%',
             }"
-            >{{ seg.text }}</span
+            >{{ seg.text || '------' }}</span
           >
         </span>
-        <template v-else>{{ line.text }}</template>
+        <span
+          v-else-if="index === currentLyricIndex"
+          class="lyric-karaoke"
+        >
+          <span :style="{ '--progress': lineUniformProgress + '%', whiteSpace: 'normal' }">{{ line.text || '------' }}</span>
+        </span>
+        <template v-else>{{ line.text || '------' }}</template>
         <span v-if="line.pairlyric" class="lyric-pair">{{ line.pairlyric }}</span>
       </div>
     </div>
@@ -656,22 +780,20 @@ window.addEventListener("resize", updateMarqueeStatus);
       </div>
       <div class="player-right">
         <div class="player-info">
-          <div class="player-info">
-            <component
-              :is="songNameTooLong ? 'marquee' : 'div'"
-              class="marquee name"
-              ref="songNameRef"
-            >
-              {{ playlist[currentIndex]?.name || "加载中..." }}
-            </component>
-            <component
-              :is="artistTooLong ? 'marquee' : 'div'"
-              class="marquee artist"
-              ref="artistRef"
-            >
-              {{ playlist[currentIndex]?.artist || "加载中..." }}
-            </component>
-          </div>
+          <component
+            :is="songNameTooLong ? 'marquee' : 'div'"
+            class="marquee name"
+            ref="songNameRef"
+          >
+            {{ playlist[currentIndex]?.name || "加载中..." }}
+          </component>
+          <component
+            :is="artistTooLong ? 'marquee' : 'div'"
+            class="marquee artist"
+            ref="artistRef"
+          >
+            {{ playlist[currentIndex]?.artist || "加载中..." }}
+          </component>
         </div>
 
         <div class="player-progress">
@@ -760,7 +882,7 @@ window.addEventListener("resize", updateMarqueeStatus);
       <div class="player-musicselect">
         <div
           v-for="(song, index) in playlist"
-          :key="song.url"
+          :key="song.id || index"
           class="track"
           :class="{ active: index === currentIndex }"
           @click="selectTrack(index)"
@@ -1069,7 +1191,7 @@ window.addEventListener("resize", updateMarqueeStatus);
 }
 
 .lyric-pair {
-  font-size: 10px;
+  font-size: 11px;
   opacity: 0.6;
   margin-left: 6px;
 }
