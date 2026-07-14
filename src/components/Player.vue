@@ -40,6 +40,11 @@ const trackRefs = ref<HTMLElement[]>([]);
 
 const playlistId = config.playlistIdWyy;
 const metingApi = `https://api.qijieya.cn/meting/?type=playlist&id=${playlistId}`;
+const yrcCorsApi = "https://cors.emnasop.cn/api/lyric?id=IDZFC";
+/*
+  Cors代理,原为“https://music.163.com/api/song/lyric?os=pc&id=${musicid}&yv=-1&tv=-1&rv=-1&lv=-1”
+  Meting API中没有提供逐词歌词,所以使用网易云官方接口并使用Cors代理获取逐词歌词
+*/
 
 const progressPercent = computed(() => {
   if (!duration.value || !isFinite(duration.value) || duration.value === 0)
@@ -73,8 +78,131 @@ const parseLRC = (lrc: string) => {
     .filter((l): l is { time: number; text: string } => !!l);
 };
 
+async function parseYrc(datae: any) {
+  function prpdl(yrc: any, timesec: number) {
+    const timeTagRegex = /\[(\d+):(\d+)(?:[.:](\d+))?\](.*)/;
+    let pairif = false;
+    let pairtext = "";
+    let min_pairtime = 1;
+    if (yrc.tlyric.lyric) {
+      let pairlyrics = yrc.tlyric.lyric
+        .split("\n")
+        .filter((item: string) => timeTagRegex.test(item));
+      if (yrc.ytlrc && yrc.ytlrc.lyric) {
+        pairlyrics = yrc.ytlrc.lyric
+          .split("\n")
+          .filter((item: string) => timeTagRegex.test(item));
+        min_pairtime = 0.01;
+      }
+      for (let i = 0; i < pairlyrics.length; i++) {
+        let lyricMatch = pairlyrics[i].match(timeTagRegex);
+        if (!lyricMatch) continue;
+        let text = lyricMatch[4];
+        const decimal = lyricMatch[3]
+          ? lyricMatch[3].toString().length === 2
+            ? parseInt(lyricMatch[3]) / 100
+            : parseInt(lyricMatch[3]) / 1000
+          : 0;
+        let timesecp =
+          parseInt(lyricMatch[1]) * 60 + parseInt(lyricMatch[2]) + decimal;
+        if (min_pairtime > Math.abs(timesec - timesecp)) {
+          min_pairtime = Math.abs(timesec - timesecp);
+          pairtext = text.replace("//", "");
+        }
+      }
+      pairif = true;
+    }
+    return { pairtext, pairif};
+  }
+  const timeTagRegex = /\[(\d+):(\d+)(?:[.:](\d+))?\](.*)/;
+  const zqTagRegex = /\[(\d+),(\d+)?\](.*)/;
+  const regex = /\((\d+),(\d+),(\d+)\)(.*?)(?=\(\d+,\d+,\d+\)|$)/g;
+  const yrc = datae;
+  interface json {
+    time: number;
+    text: string;
+    etext?: any[];
+    pairlyric?: string;
+  }
+  const json: json[] = [];
+  if (!yrc.yrc && !yrc.tlyric) {
+    //没有歌词（大概率纯音乐）
+    return json;
+  }
+  let pdjg = { pairtext: "", pairif: false};
+  if (yrc.yrc && yrc.yrc.lyric) {
+    yrc.yrc.lyric = yrc.yrc.lyric.replace(/^\uFEFF/, "");
+    const lyrics = yrc.yrc.lyric.split("\n");
+    for (const lyric of lyrics) {
+      let lyricMatch = lyric.match(zqTagRegex);
+      let text;
+      let timesec;
+      if (!lyricMatch) continue;
+      text = lyricMatch[3];
+      timesec = lyricMatch[1] / 1000;
+      let eljson = [];
+      if (text.includes("(") && text.includes(")")) {
+        let ttt;
+        while ((ttt = regex.exec(lyric)) !== null) {
+          const Duration = parseInt(ttt[2]) / 1000;
+          const start = parseInt(ttt[1]) / 1000;
+          const totalSecondsEnd = (parseInt(ttt[1]) + parseInt(ttt[2])) / 1000;
+          const texte = ttt[4].replace(" ", "\u00A0");
+          eljson.push({
+            Duration: Duration,
+            start: start,
+            end: totalSecondsEnd,
+            text: texte,
+          });
+        }
+        if (eljson[eljson.length - 1].text == "&nbsp;") eljson.pop();
+      }
+      text = text.replace(/\(\d+,\d+,\d+\)/g, "");
+      pdjg = prpdl(yrc, timesec);
+      json.push({
+        time: timesec,
+        text: text,
+        etext: eljson,
+        pairlyric: pdjg.pairtext,
+      });
+    }
+  } else if (yrc.lrc.lyric) {
+    //没有逐字/词歌词
+    let lyrics = yrc.lrc.lyric
+      .split("\n")
+      .filter((item: string) => timeTagRegex.test(item));
+    for (const lyric of lyrics) {
+      let lyricMatch = lyric.match(timeTagRegex);
+      const decimal = lyricMatch[3]
+        ? lyricMatch[3].toString().length === 2
+          ? parseInt(lyricMatch[3]) / 100
+          : parseInt(lyricMatch[3]) / 1000
+        : 0;
+      let timesec =
+        parseInt(lyricMatch[1]) * 60 + parseInt(lyricMatch[2]) + decimal;
+      pdjg = prpdl(yrc, timesec);
+      json.push({
+        time: timesec,
+        text: `${lyricMatch[4]} (${pdjg.pairtext})`,
+      });
+    }
+  }
+  console.log(json);
+  return json;
+}
+
 const loadLyricsForCurrentSong = async () => {
   const song = playlist.value[currentIndex.value];
+  try {
+    const zz = song?.url?.match(/\d+/g);
+    const id = zz ? zz[zz.length-1] : null;
+    if(!id) return;
+    const yrc = await (await fetch(yrcCorsApi.replace("IDZFC", id))).json();
+    allLyrics.value = await parseYrc(yrc);
+    return;
+  } catch (error) {
+    console.error("Failed to load YRC lyrics:", error);
+  }
   if (song?.lrc) {
     allLyrics.value = parseLRC(await (await fetch(song.lrc)).text());
     currentLyricIndex.value = 0;
