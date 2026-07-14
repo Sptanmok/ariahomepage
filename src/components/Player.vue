@@ -51,9 +51,17 @@ const progressPercent = computed(() => {
     return 0;
   return Math.min(100, Math.max(0, (progress.value / duration.value) * 100));
 });
+type LrcSeg = {
+  Duration: number;
+  start: number;
+  end: number;
+  text: string;
+};
 type LrcLine = {
   time: number;
   text: string;
+  etext?: LrcSeg[];
+  pairlyric?: string;
 };
 const volumePercent = computed(() => volume.value * 100);
 const playerContainerRef = ref<HTMLElement | null>(null);
@@ -61,6 +69,8 @@ const buttonRef = ref<HTMLElement | null>(null);
 const currentLyricIndex = ref(0);
 const allLyrics = ref<LrcLine[]>([]);
 const visibleLyrics = ref<LrcLine[]>([]);
+const currentTime = ref(0);
+let rafId = 0;
 
 const parseLRC = (lrc: string) => {
   return lrc
@@ -183,7 +193,7 @@ async function parseYrc(datae: any) {
       pdjg = prpdl(yrc, timesec);
       json.push({
         time: timesec,
-        text: `${lyricMatch[4]} (${pdjg.pairtext})`,
+        text: lyricMatch[4]+(pdjg.pairtext?` (${pdjg.pairtext})`:''),
       });
     }
   }
@@ -248,6 +258,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   document.removeEventListener("click", onClickOutside);
+  if (rafId) cancelAnimationFrame(rafId);
 });
 
 watch(currentUrl, () => {
@@ -309,12 +320,24 @@ const togglePlay = () => {
   }
 };
 
+const tickKaraoke = () => {
+  if (audioRef.value) {
+    currentTime.value = audioRef.value.currentTime;
+  }
+  rafId = requestAnimationFrame(tickKaraoke);
+};
+
 const onPlay = () => {
   isPlaying.value = true;
+  if (!rafId) rafId = requestAnimationFrame(tickKaraoke);
   saveState();
 };
 const onPause = () => {
   isPlaying.value = false;
+  if (rafId) {
+    cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
   saveState();
 };
 
@@ -562,10 +585,32 @@ window.addEventListener("resize", updateMarqueeStatus);
         v-for="(line, index) in allLyrics"
         :key="line.time"
         class="lyric-line"
-        :class="{ current: index === currentLyricIndex }"
+        :class="{
+          current: index === currentLyricIndex,
+          passed: index < currentLyricIndex,
+        }"
         style="height: 24px; line-height: 24px"
       >
-        {{ line.text }}
+        <span
+          v-if="index === currentLyricIndex && line.etext && line.etext.length"
+          class="lyric-karaoke"
+        >
+          <span
+            v-for="(seg, segIdx) in line.etext"
+            :key="segIdx"
+            :style="{
+              '--progress':
+                currentTime >= seg.start && currentTime <= seg.end
+                  ? ((currentTime - seg.start) / seg.Duration) * 100 + '%'
+                  : currentTime > seg.end
+                  ? '100%'
+                  : '0%',
+            }"
+            >{{ seg.text }}</span
+          >
+        </span>
+        <template v-else>{{ line.text }}</template>
+        <span v-if="line.pairlyric" class="lyric-pair">{{ line.pairlyric }}</span>
       </div>
     </div>
   </div>
@@ -1009,16 +1054,41 @@ window.addEventListener("resize", updateMarqueeStatus);
   white-space: nowrap;
   text-overflow: ellipsis;
   overflow: hidden;
-  opacity: 0.6;
-  color: var(--font-color);
+  color: color-mix(in srgb, var(--font-color) 35%, transparent);
   font-size: 14px;
+  font-weight: bold;
   transition: color 0.3s;
 }
 
+.lyric-line.passed {
+  color: var(--font-color);
+}
+
 .lyric-line.current {
-  opacity: 1;
-  font-size: 16px;
+  color: var(--font-color);
+}
+
+.lyric-pair {
+  font-size: 10px;
+  opacity: 0.6;
+  margin-left: 6px;
+}
+
+.lyric-karaoke {
+  display: inline;
+}
+.lyric-karaoke span {
+  display: inline-block;
+  white-space: pre;
   font-weight: bold;
+  background: linear-gradient(
+    to right,
+    var(--font-color) var(--progress, 0%),
+    color-mix(in srgb, var(--font-color) 35%, transparent) var(--progress, 0%)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
 /* 新句子从下滑入 */
