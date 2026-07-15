@@ -44,6 +44,7 @@ const yrcCorsApi = "https://cors.emnasop.cn/api/lyric?id=IDZFC";
 /*
   Cors代理,原为“https://music.163.com/api/song/lyric?os=pc&id=${musicid}&yv=-1&tv=-1&rv=-1&lv=-1”
   Meting API中没有提供逐词歌词,所以使用网易云官方接口并使用Cors代理获取逐词歌词
+  注意！上api没有albumName，它来自http://music.163.com/api/song/detail/?id=${musicid}&ids=%5B${musicid}%5D的songs[0].album.name
 */
 
 const CACHE_KEY = `playlist-cache-${playlistId}`;
@@ -165,13 +166,7 @@ async function parseYrc(datae: any) {
   const zqTagRegex = /\[(\d+),(\d+)?\](.*)/;
   const regex = /\((\d+),(\d+),(\d+)\)(.*?)(?=\(\d+,\d+,\d+\)|$)/g;
   const yrc = datae;
-  interface json {
-    time: number;
-    text: string;
-    etext?: any[];
-    pairlyric?: string;
-  }
-  const json: json[] = [];
+  const json: LrcLine[] = [];
   if (!yrc.yrc && !yrc.tlyric) {
     //没有歌词（大概率纯音乐）
     return json;
@@ -237,17 +232,204 @@ async function parseYrc(datae: any) {
   }
   return json;
 }
-
+async function QQJsonGET(
+  name: string,
+  artist: string,
+  album: string,
+) {
+  function stringSimilarity(a: string, b: string) {
+    const strA = a == null ? "" : String(a);
+    const strB = b == null ? "" : String(b);
+    const lenA = strA.length,
+      lenB = strB.length;
+    if (lenA === 0 && lenB === 0) return 1;
+    if (lenA === 0 || lenB === 0) return 0;
+    let prev = Array.from({ length: lenB + 1 }, (_, i) => i);
+    let curr = new Array(lenB + 1);
+    for (let i = 1; i <= lenA; i++) {
+      curr[0] = i;
+      for (let j = 1; j <= lenB; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        curr[j] = Math.min(
+          curr[j - 1] + 1,
+          prev[j] + 1,
+          prev[j - 1] + cost,
+        );
+      }
+      [prev, curr] = [curr, prev];
+    }
+    const distance = prev[lenB];
+    return 1 - distance / Math.max(lenA, lenB);
+  }
+  let nmed;
+  try {
+    nmed = await fetch(
+      `https://api.vkeys.cn/v2/music/tencent/search/song?word=${encodeURIComponent(name.replace(/-.*$/, ''))}%20${encodeURIComponent(artist)}%20${album==name?'':encodeURIComponent(album)}`
+    );
+  } catch (error) {
+    console.error('请求失败:', error);
+    nmed = null;
+  }
+  if (!nmed || !nmed.ok) {
+    return;
+  }
+  let nme = await nmed.json();
+  if (!nme.data || !Array.isArray(nme.data) || nme.data.length === 0) {
+    return;
+  }
+  let max=0;
+  let index=-1;
+  for(let i=0;i<nme.data.length;i++){
+    const qqName = nme.data[i].song?nme.data[i].song:"";const qqArtist = nme.data[i].singer?nme.data[i].singer:"";const qqAlbum = nme.data[i].album?nme.data[i].album:"";
+    const qqList = qqArtist.replace(/\([^)]*\)/g, '').replace(/ /g, "").toUpperCase().split("/");
+    const wyList = artist.replace(/\([^)]*\)/g, '').replace(/ /g, "").toUpperCase().split("/");
+    let a_aru = 0;
+    for (const qq of qqList) { 
+      for (const wy of wyList) {
+        const sim = stringSimilarity(qq, wy);
+        if (sim > a_aru) {
+          a_aru = sim;
+        }
+      }
+    }
+    const a_tiu = stringSimilarity(qqName.replace(/\([^)]*\)/g, '').replace(/-.*$/, '').replace(/ /g, "").toUpperCase(),name.replace(/\([^)]*\)/g, '').replace(/-.*$/, '').replace(/ /g, "").toUpperCase())
+    const a_alu = album==name||qqName==qqAlbum?1:stringSimilarity(qqAlbum.replace(/\([^)]*\)/g, '').replace(/ /g, "").toUpperCase(),album.replace(/\([^)]*\)/g, '').replace(/ /g, "").toUpperCase())
+    if(a_tiu+a_aru+a_alu>max){
+      max=a_tiu+a_aru+a_alu;
+      index=i;
+    }
+  }
+  if(!nme.data[index]){
+    return;
+  }
+  const qqName = nme.data[index].song?nme.data[index].song:"";const qqArtist = nme.data[index].singer?nme.data[index].singer:"";const qqAlbum = nme.data[index].album?nme.data[index].album:"";
+  if(max<1.7){
+    return;
+  }else if(index===-1){
+    return;
+  }
+  let dataejson;
+  try {
+    const response = await fetch(
+      `https://api.vkeys.cn/v2/music/tencent/lyric?id=${nme.data[index].id}`
+    );
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    dataejson = await response.json();
+  } catch (error) {
+    console.error('请求失败:', error);
+  }
+  if (!dataejson || !dataejson.data) {
+    return;
+  }
+  let qrc = { orig: null, ts: null, roma: null };
+  qrc.orig = dataejson.data.yrc;
+  qrc.ts = dataejson.data.trans;
+  qrc.roma = dataejson.data.roma;
+  let qrcjson = QrcToJson(qrc, nme.data[0].id);
+  if (qrcjson) {
+    return qrcjson;
+  }
+  return qrcjson;
+}
+function QrcToJson(qrcd: any, id: number) {
+  let qrc = qrcd;
+  const metadataRegex = /^\s*\[([a-zA-Z]+)\s*:\s*(.*?)\]\s*$/;
+  const zqTagRegex = /\[(\d+),(\d+)?\](.*)/;
+  const regex = /(.*?)\((\d+),(\d+)\)/g;
+  function prpdlq(qrc: any, timesec: number) {
+    const timeTagRegex = /\[(\d+):(\d+)(?:[.:](\d+))?\](.*)/;
+    let pairif = false;
+    let pairtext = "";
+    let min_pairtime = 3;
+    if (qrc.ts) {
+      let pairlyrics;
+      let lyricMatch;
+      pairlyrics = qrc.ts
+        .split("\n")
+        .filter((item: string) => timeTagRegex.test(item));
+        for (let i = 0; i < pairlyrics.length; i++) {
+          lyricMatch =pairlyrics[i].match(timeTagRegex)
+          if (!lyricMatch) continue;
+          let text = lyricMatch[4];
+          const decimal = lyricMatch[3] ? (lyricMatch[3].toString().length === 2 ? parseInt(lyricMatch[3]) / 100 : parseInt(lyricMatch[1])/1000):0
+          let timesecp = parseInt(lyricMatch[1]) * 60 + parseInt(lyricMatch[2]) + decimal
+          if (min_pairtime > Math.abs(timesec - timesecp)) {
+          min_pairtime = Math.abs(timesec - timesecp);
+          pairtext = text.replace("//", "");
+        }
+      }
+      pairif = true;
+    }
+    return { pairtext, pairif};
+  }
+  let json: LrcLine[] = [];
+  if (qrc.orig) {
+    let pdjg;
+    qrc.orig = qrc.orig.replace(/^\uFEFF/, "");
+    const lyrics = qrc.orig.split("\n");
+    for (const lyric of lyrics) {
+      const metadataMatch = lyric.match(metadataRegex);
+      if (metadataMatch) {
+        continue;
+      }
+      let lyricMatch = lyric.match(zqTagRegex);
+      let text;
+      let timesec;
+      if (!lyricMatch) continue;
+      text = lyricMatch[3];
+      timesec = lyricMatch[1] / 1000;
+      let eljson = [];
+      if (text.includes("(") && text.includes(")")) {
+        let ttt;
+        let i = 0;
+        while ((ttt = regex.exec(lyric.replace(/\[.*?\]/g, "")))) {
+          const Duration = parseInt(ttt[3]) / 1000;
+          const start = parseInt(ttt[2]) / 1000;
+          const totalSecondsEnd = (parseInt(ttt[2]) + parseInt(ttt[3])) / 1000;
+          const texte = ttt[1].replace(/ /g, "\u00A0");
+          eljson.push({
+            Duration: Duration,
+            start: start,
+            end: totalSecondsEnd,
+            text: texte,
+          });
+        }
+      }
+      text = text.replace(/\(\d+,\d+\)/g, "");
+      pdjg = prpdlq(qrc, timesec);
+      json.push({
+        time: timesec,
+        text: text,
+        etext: eljson,
+        pairlyric: pdjg.pairtext
+      });
+    }
+  }
+  console.log(json);
+  return json;
+}
 const loadLyricsForCurrentSong = async () => {
   const song = playlist.value[currentIndex.value];
   const id = song?.id;
   if (!id) return;
   try {
+    let lyrics;
     const yrc = await (await fetch(yrcCorsApi.replace("IDZFC", id))).json();
-    allLyrics.value = await parseYrc(yrc);
+    lyrics = await parseYrc(yrc);
+    if(!lyrics[0]?.etext){
+      console.log("尝试使用Q音乐API查询逐词...")
+      const qrc = await QQJsonGET(song?.name || "",song?.artist || "",yrc.albumName || (song?.name || ""))
+      if(qrc&&qrc.length!==0&&qrc[0].etext){
+        console.log("QQ音乐API查询成功，使用QQ音乐歌词");
+        lyrics = qrc
+      }
+    }
+    allLyrics.value=lyrics;
     return;
   } catch (error) {
-    console.error("Failed to load YRC lyrics:", error);
+    console.error("Failed to load K lyrics:", error);
   }
   if (song?.lrc) {
     allLyrics.value = parseLRC(await (await fetch(song.lrc)).text());
